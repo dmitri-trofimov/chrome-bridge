@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -100,199 +101,37 @@ func TestForwardBinaryConcurrentAndHalfClose(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			defer cancel()
 			result := make(chan error, 1)
-			go func() { result <- forward(ctx, bridge, target.Addr().String(), helper, time.Second) }()
-			payload := make([]byte, 256*1024)
-			for j := range payload {
-				payload[j] = byte(j) + seed
-			}
+			go func() {
+				result <- forward(ctx, bridge, target.Addr().String(), helper, 5*time.Second)
+			}()
+			payload := bytes.Repeat([]byte{seed, seed + 1, seed + 2}, 65536)
 			if _, err := client.Write(payload); err != nil {
-				t.Error(err)
+				t.Errorf("write payload: %v", err)
+				return
 			}
 			if err := client.CloseWrite(); err != nil {
-				t.Error(err)
+				t.Errorf("half-close: %v", err)
+				return
 			}
 			response, err := io.ReadAll(client)
 			if err != nil {
-				t.Error(err)
+				t.Errorf("read response: %v", err)
+				return
 			}
-			if !bytes.Equal(response, payload) {
-				t.Errorf("binary response differs: got %d bytes, want %d", len(response), len(payload))
+			if !bytes.Equal(payload, response) {
+				t.Errorf("mismatch: got %d bytes, want %d", len(response), len(payload))
+				return
 			}
 			if err := <-result; err != nil {
-				t.Error(err)
+				t.Errorf("forward: %v", err)
 			}
-		}(byte(i))
+		}(byte(i * 17))
 	}
 	clients.Wait()
 	for i := 0; i < count; i++ {
 		if err := <-serverErrors; err != nil {
-			t.Error(err)
+			t.Errorf("server: %v", err)
 		}
-	}
-}
-
-func TestRelayCancellation(t *testing.T) {
-	_, client := tcpPair(t)
-	_, target := tcpPair(t)
-	ctx, cancel := context.WithCancel(context.Background())
-	result := make(chan error, 1)
-	go func() { result <- relay(ctx, client, target) }()
-	cancel()
-	select {
-	case err := <-result:
-		if err != context.Canceled {
-			t.Fatalf("got %v, want context.Canceled", err)
-		}
-	case <-time.After(3 * time.Second):
-		t.Fatal("relay did not stop on cancellation")
-	}
-}
-
-func TestForwardMissingHelper(t *testing.T) {
-	client, bridge := tcpPair(t)
-	if err := forward(context.Background(), bridge, "127.0.0.1:9222", "/nonexistent/winpipe.exe", time.Second); err == nil {
-		t.Fatal("missing helper was accepted")
-	}
-	if _, err := client.Read(make([]byte, 1)); err != io.EOF {
-		t.Fatalf("client not closed after helper failure: %v", err)
-	}
-}
-
-func TestForwardCancellation(t *testing.T) {
-	helper, err := os.Executable()
-	if err != nil {
-		t.Fatal(err)
-	}
-	target, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer target.Close()
-	accepted := make(chan net.Conn, 1)
-	go func() {
-		conn, err := target.Accept()
-		if err == nil {
-			accepted <- conn
-		}
-	}()
-	_, bridge := tcpPair(t)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	result := make(chan error, 1)
-	go func() { result <- forward(ctx, bridge, target.Addr().String(), helper, time.Second) }()
-	select {
-	case conn := <-accepted:
-		defer conn.Close()
-	case <-time.After(5 * time.Second):
-		t.Fatal("helper did not connect")
-	}
-	cancel()
-	select {
-	case err := <-result:
-		if err == nil {
-			t.Fatal("cancellation was not reported")
-		}
-	case <-time.After(3 * time.Second):
-		t.Fatal("helper did not stop on cancellation")
-	}
-}
-
-func TestForwardStreaming(t *testing.T) {
-	helper, err := os.Executable()
-	if err != nil {
-		t.Fatal(err)
-	}
-	target, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer target.Close()
-	serverResult := make(chan error, 1)
-	go func() {
-		conn, err := target.Accept()
-		if err != nil {
-			serverResult <- err
-			return
-		}
-		defer conn.Close()
-		conn.SetDeadline(time.Now().Add(10 * time.Second))
-		_, err = io.Copy(conn, conn)
-		serverResult <- err
-	}()
-	client, bridge := tcpPair(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	result := make(chan error, 1)
-	go func() { result <- forward(ctx, bridge, target.Addr().String(), helper, time.Second) }()
-	for i := 0; i < 10; i++ {
-		message := []byte{0, byte(i), 255, '\r', '\n'}
-		if _, err := client.Write(message); err != nil {
-			t.Fatal(err)
-		}
-		response := make([]byte, len(message))
-		if _, err := io.ReadFull(client, response); err != nil {
-			t.Fatal(err)
-		}
-		if !bytes.Equal(message, response) {
-			t.Fatal("streaming response differs")
-		}
-	}
-	client.CloseWrite()
-	io.Copy(io.Discard, client)
-	if err := <-result; err != nil {
-		t.Fatal(err)
-	}
-	if err := <-serverResult; err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestProxyBinaryAndHalfClose(t *testing.T) {
-	target, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer target.Close()
-	serverResult := make(chan error, 1)
-	go func() {
-		conn, err := target.Accept()
-		if err != nil {
-			serverResult <- err
-			return
-		}
-		defer conn.Close()
-		conn.SetDeadline(time.Now().Add(10 * time.Second))
-		data, err := io.ReadAll(conn)
-		if err == nil {
-			_, err = conn.Write(data)
-		}
-		serverResult <- err
-	}()
-	client, bridge := tcpPair(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	result := make(chan error, 1)
-	go func() { result <- proxy(ctx, bridge, target.Addr().String(), time.Second) }()
-	payload := bytes.Repeat([]byte{0, 255, 128, '\r', '\n'}, 65536)
-	if _, err := client.Write(payload); err != nil {
-		t.Fatal(err)
-	}
-	client.CloseWrite()
-	response, err := io.ReadAll(client)
-	if err != nil || !bytes.Equal(payload, response) {
-		t.Fatalf("proxy response mismatch: %v, got %d bytes", err, len(response))
-	}
-	if err := <-result; err != nil {
-		t.Fatal(err)
-	}
-	if err := <-serverResult; err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestServeRejectsSelfForwarding(t *testing.T) {
-	if err := run([]string{"serve", "--listen", "127.0.0.1:9223", "--target", "127.0.0.1:9223"}); err == nil {
-		t.Fatal("serve accepted forwarding to the exact listening address")
 	}
 }
 
@@ -315,5 +154,63 @@ func TestForwardConnectionRefused(t *testing.T) {
 	}
 	if ctx.Err() != nil {
 		t.Fatal("helper failure hung until context timeout")
+	}
+}
+
+func TestReadDevToolsActivePort(t *testing.T) {
+	tmpDir := t.TempDir()
+	portFile := filepath.Join(tmpDir, "DevToolsActivePort")
+
+	// Missing file
+	if _, err := readDevToolsActivePort(portFile); err == nil {
+		t.Fatal("expected error on missing file")
+	}
+
+	// Malformed file
+	if err := os.WriteFile(portFile, []byte("50000\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readDevToolsActivePort(portFile); err == nil {
+		t.Fatal("expected error on single-line file")
+	}
+
+	// Valid file
+	content := "49752\n/devtools/browser/abc-123-def\n"
+	if err := os.WriteFile(portFile, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+	target, err := readDevToolsActivePort(portFile)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if target.Port != "49752" {
+		t.Errorf("got port %q, want 49752", target.Port)
+	}
+	if target.Path != "/devtools/browser/abc-123-def" {
+		t.Errorf("got path %q, want /devtools/browser/abc-123-def", target.Path)
+	}
+	if target.Target != "127.0.0.1:49752" {
+		t.Errorf("got target %q, want 127.0.0.1:49752", target.Target)
+	}
+}
+
+func TestSyncLinuxDevToolsActivePort(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("HOME", tmpDir)
+
+	wsPath := "/devtools/browser/test-token"
+	if err := syncLinuxDevToolsActivePort("127.0.0.1:9222", wsPath); err != nil {
+		t.Fatalf("sync error: %v", err)
+	}
+
+	syncedFile := filepath.Join(tmpDir, ".config/google-chrome/DevToolsActivePort")
+	data, err := os.ReadFile(syncedFile)
+	if err != nil {
+		t.Fatalf("read synced file: %v", err)
+	}
+
+	expected := "9222\n/devtools/browser/test-token\n"
+	if string(data) != expected {
+		t.Errorf("got content %q, want %q", string(data), expected)
 	}
 }

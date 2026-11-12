@@ -1,225 +1,66 @@
-# winpipe
+# chrome-bridge
 
-A lightweight TCP bridge from WSL to Windows over stdio.
+Zero-configuration Chrome DevTools bridge from WSL to Windows over stdio.
 
-Run your tools in WSL and reach Windows-local services without changing WSL NAT
-networking, opening firewall ports, or installing an SSH server. WSL interop must
-be enabled: the Linux listener launches a Windows executable for each connection.
+Enables AI coding agents (such as Gemini CLI / Antigravity, Claude, Cursor) and developer tools running in WSL to seamlessly connect to your everyday Google Chrome browser on Windows without modifying shortcuts, changing firewall rules, or manually updating ports.
 
 ```text
-WSL TCP client -> Linux winpipe -> stdin/stdout -> Windows winpipe.exe -> Windows TCP service
+WSL DevTools client (127.0.0.1:9222)
+       │
+       ▼
+Linux chrome-bridge
+       │
+       ▼ (stdin/stdout via WSL interop)
+Windows chrome-bridge.exe
+       │
+       ▼
+Windows Chrome (dynamic ephemeral port)
 ```
 
-## Build
+## Features
 
-Requires Go 1.22 or newer on the build machine. Windows needs no Go installation.
-For x64 Linux and Windows, run from the project directory:
+- **Zero Arguments:** Run `chrome-bridge` or enable the systemd service. No flags or configuration required.
+- **Port Auto-detection:** Dynamically discovers Windows Chrome's active DevTools port from `DevToolsActivePort`.
+- **Dynamic Routing:** If Chrome restarts and picks a new port, `chrome-bridge` detects the change on the next connection without restarting the service.
+- **Auto-Sync:** Keeps `~/.config/google-chrome/DevToolsActivePort` synchronized so MCP tools (`chrome-devtools-mcp`), Puppeteer, and Playwright connect automatically.
 
-```sh
-mkdir -p dist
-GOOS=linux GOARCH=amd64 go build -o dist/winpipe .
-GOOS=windows GOARCH=amd64 go build -o dist/winpipe.exe .
-go test -race ./...
+## Quick Start / Installation
+
+Clone the repository and run the install script:
+
+```bash
+git clone https://github.com/dmitri-trofimov/chrome-bridge.git
+cd chrome-bridge
+./install.sh
 ```
 
-Use `GOARCH=arm64` instead for ARM64 machines. The race detector additionally
-requires a C compiler in WSL; without one, run `go test ./...`.
+`install.sh` will:
+1. Build both `dist/chrome-bridge` (Linux) and `dist/chrome-bridge.exe` (Windows).
+2. Run test suites.
+3. Install binaries to `~/.local/bin/` and `~/.local/lib/chrome-bridge/`.
+4. Install, enable, and start the systemd user service `chrome-bridge.service`.
 
-The Windows executable can stay in this project: WSL interop can launch it
-directly from the Linux filesystem. Alternatively, copy it to a Windows directory
-you own (for example `C:\Users\<you>\Tools\winpipe.exe`).
+### Uninstallation
 
-## Forward a port
+To remove the service and binaries:
 
-Run in WSL:
-
-```sh
-./dist/winpipe listen \
-  --listen 127.0.0.1:8080 \
-  --target 127.0.0.1:3000 \
-  --helper "$(pwd)/dist/winpipe.exe"
+```bash
+./uninstall.sh
 ```
 
-WSL's `localhost:8080` now reaches Windows's `localhost:3000`. The target is
-resolved on Windows. Each accepted connection gets its own helper process;
-HTTP, HTTPS, WebSockets, SSH, databases, and other TCP protocols can pass through.
-Multiple concurrent connections are supported. Stop the listener with Ctrl+C.
+## How to Use with Chrome
 
-The listener only accepts literal loopback addresses, including `[::1]:8080`.
-The connection timeout defaults to 10 seconds (`--dial-timeout 30s` to change it).
-There is no idle timeout, so long-lived WebSockets stay open.
+1. In Windows Chrome, open `chrome://inspect/#remote-debugging` and ensure the remote debugging server is running.
+2. Any WSL tool connecting to `127.0.0.1:9222` (or using `chrome-devtools-mcp --autoConnect`) connects directly to your active Windows Chrome tabs.
+3. Chrome may display a one-time approval prompt: click **Allow**.
 
-## Windows Chrome with a Linux MCP server
+## Manual Build & Run
 
-1. Launch a separate Chrome instance from Windows PowerShell:
+```bash
+# Build
+GOOS=linux GOARCH=amd64 go build -o dist/chrome-bridge .
+GOOS=windows GOARCH=amd64 go build -o dist/chrome-bridge.exe .
 
-   ```powershell
-   & "$env:ProgramFiles\Google\Chrome\Application\chrome.exe" `
-     --remote-debugging-port=9222 `
-     "--user-data-dir=$env:LOCALAPPDATA\winpipe\chrome-profile"
-   ```
-
-   Adjust the Chrome executable path if needed. Keep the debugging listener on
-   loopback. Chrome requires a non-default user-data directory for this launch.
-   Do not use this profile for sensitive browsing: local processes and the agent
-   can control it.
-
-2. Start the bridge in WSL:
-
-   ```sh
-   ./dist/winpipe listen \
-     --listen 127.0.0.1:9222 \
-     --target 127.0.0.1:9222 \
-     --helper "$(pwd)/dist/winpipe.exe"
-   ```
-
-3. Verify discovery from WSL:
-
-   ```sh
-   curl http://127.0.0.1:9222/json/version
-   ```
-
-4. Run the MCP server using Linux Node.js:
-
-   ```sh
-   npx -y chrome-devtools-mcp@latest \
-     --browser-url=http://127.0.0.1:9222 \
-     --no-usage-statistics
-   ```
-
-   For OpenCode V2, merge this into your configuration:
-
-   ```jsonc
-   {
-     "$schema": "https://opencode.ai/config.json",
-     "mcp": {
-       "servers": {
-         "chrome-devtools": {
-           "type": "local",
-           "command": [
-             "npx", "-y", "chrome-devtools-mcp@latest",
-             "--browser-url=http://127.0.0.1:9222",
-             "--no-usage-statistics"
-           ]
-         }
-       }
-     }
-   }
-   ```
-
-Using port 9222 on both sides lets Chrome's advertised loopback WebSocket URL
-point through the bridge without rewriting. For other ports or unusual advertised
-addresses, use the MCP server's `--ws-endpoint` with the WSL listening address
-and the browser path from `/json/version`.
-
-## Start automatically with WSL
-
-For WSL distributions with systemd enabled, install the binaries and user service
-from this project directory:
-
-```sh
-install -Dm755 dist/winpipe "$HOME/.local/bin/winpipe"
-install -Dm755 dist/winpipe.exe "$HOME/.local/lib/winpipe/winpipe.exe"
-install -Dm644 contrib/systemd/winpipe.service "$HOME/.config/systemd/user/winpipe.service"
-systemctl --user daemon-reload
-loginctl enable-linger "$USER"
-systemctl --user enable --now winpipe.service
+# Run directly
+./dist/chrome-bridge
 ```
-
-Enabling linger starts the user service manager when the distribution boots,
-without requiring an interactive login. Depending on your distribution's policy,
-`loginctl enable-linger` may require administrator authorization.
-
-The supplied service forwards WSL `127.0.0.1:9222` to Windows `127.0.0.1:9222`.
-It starts with WSL and restarts on failure. Chrome need not already be running;
-the helper connects to it only when a client connects to the bridge.
-
-```sh
-systemctl --user status winpipe.service
-journalctl --user -u winpipe.service -n 50 --no-pager
-systemctl --user disable --now winpipe.service
-```
-
-After rebuilding, reinstall both binaries using the first two installation
-commands and run `systemctl --user restart winpipe.service`. To use other ports,
-edit the installed unit's `ExecStart`, reload the user manager, and restart it.
-
-This does not start WSL at Windows sign-in, keep WSL alive indefinitely, or launch
-Chrome. Those are separate startup tasks. Do not run a second manual listener on
-port 9222 while this service is active.
-
-## Persistent Windows listener at sign-in
-
-The optional `serve` command runs a persistent, local TCP relay on Windows:
-
-```powershell
-.\dist\winpipe.exe serve --listen 127.0.0.1:9223 --target 127.0.0.1:9222
-```
-
-This differs from `listen`: it connects directly to a TCP destination, without
-launching a helper. It also works on Linux. Both commands bind only to loopback.
-
-To keep a full checkout and the Windows build at `C:\dev\personal\winpipe`, clone
-the repository there. From the WSL source checkout, cross-compile into it:
-
-```sh
-git clone https://github.com/dmitri-trofimov/winpipe.git /mnt/c/dev/personal/winpipe
-GOOS=windows GOARCH=amd64 go build -o /mnt/c/dev/personal/winpipe/dist/winpipe.exe .
-```
-
-In Windows PowerShell, install the current-user sign-in shortcut and start now:
-
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\dev\personal\winpipe\contrib\windows\install-startup.ps1
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\dev\personal\winpipe\contrib\windows\start-winpipe.ps1
-```
-
-The installer refuses to overwrite an existing `winpipe.lnk`. The shortcut runs
-the launcher hidden, which starts `winpipe.exe` with `serve --listen
-127.0.0.1:9223 --target 127.0.0.1:9222 --log-file <log-path>`. It runs at your Windows
-sign-in, not before sign-in. No machine-wide execution-policy setting is changed.
-
-Logs are appended to `%LOCALAPPDATA%\winpipe\listener.log`. View them with:
-
-```powershell
-Get-Content "$env:LOCALAPPDATA\winpipe\listener.log" -Tail 50 -Wait
-```
-
-For WSL access, use the existing stdio bridge to reach this listener:
-
-```text
-WSL localhost:9222 -> interop helper -> Windows localhost:9223 -> Chrome localhost:9222
-```
-
-Install the alternate user service under the same service name:
-
-```sh
-install -Dm644 contrib/systemd/winpipe-windows-listener.service "$HOME/.config/systemd/user/winpipe.service"
-systemctl --user daemon-reload
-systemctl --user restart winpipe.service
-```
-
-This template assumes the Windows checkout is at `C:\dev\personal\winpipe`. WSL
-and Chrome startup remain separate. The Windows listener waits for connections
-even if Chrome is not running; connection failures are logged. The sign-in
-shortcut does not automatically restart the listener if it crashes. Restart it
-by running the launcher again, after stopping any existing listener.
-
-Before replacing the Windows executable with a newer build, stop the process
-whose executable path is this checkout's `dist\winpipe.exe`, update the Windows
-checkout, rebuild, and run the launcher again. Windows locks running executables.
-To disable Windows startup, remove the `winpipe.lnk` shortcut from the current
-user's Startup folder (`shell:startup`).
-
-## Limits
-
-- TCP only; no UDP or reverse forwarding.
-- Chrome and the bridge must be running before browser tools connect.
-- This is a byte relay, not a sandbox or an authentication layer.
-- Client write-half-close is forwarded; destination read EOF ends the session.
-  Protocols that require sending more client data after destination EOF are not
-  supported by this initial version.
-- Diagnostics go to stderr; helper stdout contains only forwarded bytes.
-- Real WSL-to-Windows forwarding has been smoke-tested against a Windows TCP
-  server, including binary payloads and client half-close. Chrome/MCP connectivity
-  still needs its own end-to-end test.

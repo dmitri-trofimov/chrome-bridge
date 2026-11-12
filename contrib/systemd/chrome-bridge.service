@@ -1,0 +1,13 @@
+[Unit]
+Description=Chrome DevTools Bridge (WSL to Windows)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/chrome-bridge
+Restart=always
+RestartSec=3
+TimeoutStopSec=5
+
+[Install]
+WantedBy=default.target
